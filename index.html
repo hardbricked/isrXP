@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#000000">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; worker-src blob:; connect-src https://raw.githubusercontent.com https://api.github.com; form-action 'none'; base-uri 'none'; object-src 'none'">
+<title>isrXP</title>
+<style>
+:root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; background: #000000; color: #f5f5f5; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; min-height: 100svh; display: grid; place-items: center; padding: 24px; }
+main { width: min(100%, 480px); }
+form { margin: 0; }
+input { display: block; width: 100%; min-width: 0; height: 72px; padding: 18px 22px; border: 1px solid #b91c1c; border-radius: 16px; outline: none; background: #080808; color: inherit; font: inherit; font-size: clamp(19px, 4.2vw, 25px); letter-spacing: -.035em; }
+input::placeholder { color: #858585; opacity: 1; }
+input:focus { border-color: #ef4444; box-shadow: 0 0 0 3px #ef444426; }
+input[aria-invalid="true"] { border-color: #f87171; }
+.date { margin: 12px 3px 0; text-align: center; font-size: 12px; line-height: 1.5; color: #929292; }
+#status { min-height: 20px; margin: 8px 3px 0; text-align: center; font-size: 13px; line-height: 1.5; color: #b3b3b3; overflow-wrap: anywhere; }
+#status[data-tone="success"] { color: #f5f5f5; }
+#status[data-tone="error"] { color: #fca5a5; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; white-space: nowrap; border: 0; clip: rect(0, 0, 0, 0); clip-path: inset(50%); }
+@media (prefers-reduced-motion: no-preference) { input { transition: border-color .15s, box-shadow .15s; } }
+</style>
+</head>
+<body>
+<main>
+<form id="converter" autocomplete="off" novalidate aria-busy="false">
+<label for="tag" class="sr-only">BattleTag</label>
+<input id="tag" type="text" placeholder="BattleTag#0000" maxlength="80" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-describedby="guide-date status" required>
+</form>
+<p class="date"><time id="guide-date" title="Latest guide update (UTC)">Last Update: …</time></p>
+<p id="status" role="status" aria-live="polite" aria-atomic="true"></p>
+<noscript><p class="date">Enable JavaScript to continue.</p></noscript>
+</main>
+<!--
+Upstream protocol attribution and standalone permission notice.
+No guide content is bundled. RC4 is retained only for format compatibility.
+MIT License
+
+Copyright (c) 2026 Slcker / Inariaa
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<script id="guide-worker" type="text/plain">
+'use strict';
+(()=>{
+const LIMITS=Object.freeze({
+encrypted:12*1024*1024,
+inflated:128*1024*1024,
+envelope:16*1024*1024+4096
+});
+const SOURCE_TAG='haha#6767';
+const encoder=new TextEncoder();
+let prepared=null;
+let queue=Promise.resolve();
+class GuideError extends Error{}
+function validateTag(tag){
+return typeof tag==='string'&&tag.length<=80&&/^[^#\s\p{Cc}]+#[0-9]{4,10}$/u.test(tag);
+}
+function deriveKey(tag){
+const encoded=encoder.encode(tag.toLowerCase());
+const suffix=encoded.subarray(Math.max(0,encoded.length-16));
+const key=new Uint8Array(16);
+key.set(suffix,16-suffix.length);
+for(let step=0;step<16;step++){
+const slot=(16-step)%16;
+key[slot]=key[(slot+15)%16]^key[(slot+13)%16]^
+key[(slot+12)%16]^key[(slot+10)%16];
+}
+return key;
+}
+function applyCipher(bytes,key){
+const permutation=new Uint8Array(256);
+for(let n=0;n<256;n++)permutation[n]=n;
+let cursor=0;
+for(let n=0;n<256;n++){
+cursor=(cursor+permutation[n]+key[n%key.length])&255;
+const saved=permutation[n];
+permutation[n]=permutation[cursor];
+permutation[cursor]=saved;
+}
+let left=0;
+let right=0;
+for(let n=0;n<bytes.length;n++){
+left=(left+1)&255;
+right=(right+permutation[left])&255;
+const saved=permutation[left];
+permutation[left]=permutation[right];
+permutation[right]=saved;
+bytes[n]^=permutation[(permutation[left]+permutation[right])&255];
+}
+return bytes;
+}
+function decodeBase64(text){
+if(typeof Uint8Array.fromBase64==='function')return Uint8Array.fromBase64(text);
+const binary=atob(text);
+const bytes=new Uint8Array(binary.length);
+for(let n=0;n<binary.length;n++)bytes[n]=binary.charCodeAt(n);
+return bytes;
+}
+function encodeBase64(bytes){
+if(typeof bytes.toBase64==='function')return bytes.toBase64();
+const pieces=[];
+for(let offset=0;offset<bytes.length;offset+=8192){
+pieces.push(String.fromCharCode(...bytes.subarray(offset,offset+8192)));
+}
+return btoa(pieces.join(''));
+}
+function parseEnvelope(buffer){
+if(!(buffer instanceof ArrayBuffer)||buffer.byteLength>LIMITS.envelope){
+throw new GuideError('The guide response exceeds the download limit.');
+}
+const text=new TextDecoder('utf-8',{fatal:true}).decode(buffer).trim();
+const separator=text.indexOf('|');
+const colon=text.indexOf(':',separator+1);
+const footer=text.indexOf('%',colon+1);
+if(separator<1||colon<=separator+1||colon>256||footer<=colon){
+throw new GuideError('The guide format is not supported.');
+}
+const countText=text.slice(0,separator);
+const checksumText=text.slice(separator+1,colon);
+const trailer=text.slice(footer+1);
+if(trailer.length>4096){
+throw new GuideError('The guide trailer exceeds the size limit.');
+}
+const version=/^\|(\d{1,64})(?=\||$)/.exec(trailer)?.[1]??'40000';
+if(!/^\d+$/.test(countText)||!/^\d+$/.test(checksumText)){
+throw new GuideError('The guide count or checksum is invalid.');
+}
+const count=Number(countText);
+const checksum=Number(checksumText);
+if(!Number.isSafeInteger(count)||count<1||count>99999||
+!Number.isSafeInteger(checksum)||checksum<0||checksum>0xffffffff){
+throw new GuideError('The guide metadata is out of range.');
+}
+const start=colon+(text[colon+1]===':'?2:1);
+const payload=text.slice(start,footer);
+if(payload.length>4*Math.ceil(LIMITS.encrypted/3)){
+throw new GuideError('The encoded guide exceeds the size limit.');
+}
+const padding=payload.endsWith('==')?2:payload.endsWith('=')?1:0;
+if(!/^[A-Za-z0-9+/]+={0,2}$/.test(payload)||payload.length%4===1||
+(padding>0&&payload.length%4!==0)){
+throw new GuideError('The guide contains invalid Base64 data.');
+}
+const decodedLength=Math.floor(payload.length*3/4)-padding;
+if(decodedLength<8||decodedLength>LIMITS.encrypted){
+throw new GuideError('The guide payload has an unexpected size.');
+}
+let bytes;
+try{bytes=decodeBase64(payload);}
+catch{throw new GuideError('The guide contains invalid Base64 data.');}
+if(bytes.length!==decodedLength)throw new GuideError('The guide payload is incomplete.');
+return{count,checksum,version,bytes};
+}
+async function verifyZlib(bytes,expectedChecksum){
+const header=bytes[0]*256+bytes[1];
+if((bytes[0]&15)!==8||(bytes[0]>>>4)>7||header%31!==0||(bytes[1]&32)){
+throw new GuideError('The guide could not be decoded as a supported zlib stream.');
+}
+const storedChecksum=new DataView(bytes.buffer,bytes.byteOffset+bytes.length-4,4).getUint32(0);
+if(storedChecksum!==expectedChecksum){
+throw new GuideError('The guide checksum does not match its metadata.');
+}
+if(typeof DecompressionStream!=='function'){
+throw new GuideError('This browser cannot verify guide data. Use a browser with DecompressionStream support.');
+}
+let offset=0;
+const compressed=new ReadableStream({
+pull(controller){
+if(offset>=bytes.length){controller.close();return;}
+const next=Math.min(offset+16384,bytes.length);
+controller.enqueue(bytes.subarray(offset,next));
+offset=next;
+}
+});
+const reader=compressed.pipeThrough(new DecompressionStream('deflate')).getReader();
+let expanded=0;
+try{
+while(true){
+const{value,done}=await reader.read();
+if(done)break;
+expanded+=value.byteLength;
+if(expanded>LIMITS.inflated)throw new GuideError('The expanded guide exceeds the 128 MiB safety limit.');
+}
+}catch(error){
+await reader.cancel().catch(()=>{});
+if(error instanceof GuideError)throw error;
+throw new GuideError('The guide failed full integrity validation. Press Enter to try again.');
+}finally{reader.releaseLock();}
+return expanded;
+}
+async function dispatch(message){
+const{kind}=message;
+if(kind==='prepare'){
+prepared=null;
+const source=parseEnvelope(message.buffer);
+applyCipher(source.bytes,deriveKey(SOURCE_TAG));
+const expanded=await verifyZlib(source.bytes,source.checksum);
+prepared=source;
+return{count:source.count,version:source.version,compressedBytes:source.bytes.length,expandedBytes:expanded};
+}
+if(kind==='generate'){
+if(!prepared)throw new GuideError('No verified guide is loaded. Press Enter to try again.');
+if(!validateTag(message.tag))throw new GuideError('Enter a BattleTag such as Player#12345, without spaces.');
+const output=applyCipher(prepared.bytes.slice(),deriveKey(message.tag));
+return`${prepared.count}|${prepared.checksum}:${encodeBase64(output)}%|${prepared.version}`;
+}
+throw new GuideError('Unknown conversion request.');
+}
+self.onmessage=event=>{
+queue=queue.then(async()=>{
+const{id}=event.data;
+try{self.postMessage({id,result:await dispatch(event.data)});}
+catch(error){
+self.postMessage({id,error:error instanceof GuideError?error.message:'The guide could not be processed.'});
+}
+});
+};
+self.postMessage({ready:true});
+})();
+</script>
+<script id="app-script">
+'use strict';
+(()=>{
+const SETTINGS=Object.freeze({
+source:'https://raw.githubusercontent.com/Inariaa/rxp_decrypter/main/guide.txt',
+history:'https://api.github.com/repos/Inariaa/rxp_decrypter/commits?path=guide.txt&per_page=1',
+maxDownloadBytes:16*1024*1024+4096,
+sourceLifetimeMs:5*60*1000,
+networkTimeoutMs:30000,
+workerTimeoutMs:60000,
+inputDelayMs:900
+});
+const byId=id=>document.getElementById(id);
+const ui={form:byId('converter'),tag:byId('tag'),status:byId('status'),date:byId('guide-date')};
+let revision=0;
+let active=null;
+let result=null;
+let inputTimer;
+let composing=false;
+let historyController=null;
+let historyCheckedAt=0;
+function aborted(signal){
+if(signal?.aborted)throw new DOMException('Cancelled.','AbortError');
+}
+async function fetchBytes(url,maximum,signal,timeout=SETTINGS.networkTimeoutMs){
+aborted(signal);
+const controller=new AbortController();
+let timedOut=false;
+let reader;
+const forwardAbort=()=>controller.abort();
+signal?.addEventListener('abort',forwardAbort,{once:true});
+const timer=setTimeout(()=>{timedOut=true;controller.abort();},timeout);
+try{
+const response=await fetch(url,{
+signal:controller.signal,cache:'no-cache',mode:'cors',credentials:'omit',
+referrerPolicy:'no-referrer',redirect:'error'
+});
+if(!response.ok)throw new Error(`Download failed (HTTP ${response.status}). Try again later.`);
+const declared=Number(response.headers.get('content-length'));
+if(Number.isFinite(declared)&&declared>maximum)throw new Error('The download exceeds the size limit.');
+if(!response.body?.getReader)throw new Error('This browser does not support streamed downloads.');
+reader=response.body.getReader();
+const chunks=[];
+let total=0;
+while(true){
+const{value,done}=await reader.read();
+if(done)break;
+total+=value.byteLength;
+if(total>maximum)throw new Error('The download exceeds the size limit.');
+chunks.push(value);
+}
+aborted(controller.signal);
+const bytes=new Uint8Array(total);
+let offset=0;
+for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;}
+return bytes;
+}catch(error){
+controller.abort();
+if(reader)await reader.cancel().catch(()=>{});
+if(timedOut)throw new Error('The download timed out. Check your connection and try again.');
+if(signal?.aborted)throw new DOMException('Cancelled.','AbortError');
+if(error instanceof TypeError)throw new Error('The guide host could not be reached. Check your connection and try again.');
+throw error;
+}finally{
+clearTimeout(timer);
+signal?.removeEventListener('abort',forwardAbort);
+reader?.releaseLock();
+}
+}
+class Processor{
+constructor(){
+this.pending=new Map();
+this.sequence=0;
+this.alive=false;
+if(typeof Worker!=='function')throw new Error('This browser does not support Web Workers.');
+const blob=new Blob([byId('guide-worker').textContent],{type:'text/javascript'});
+this.url=URL.createObjectURL(blob);
+try{this.worker=new Worker(this.url,{name:'isrxp-converter'});}
+catch{URL.revokeObjectURL(this.url);throw new Error('The conversion worker was blocked. Check the site security policy.');}
+this.alive=true;
+this.worker.onmessage=({data})=>{
+if(data.ready){URL.revokeObjectURL(this.url);return;}
+const request=this.pending.get(data.id);
+if(!request)return;
+this.pending.delete(data.id);
+clearTimeout(request.timer);
+if(data.error)request.reject(new Error(data.error));
+else request.resolve(data.result);
+};
+this.worker.onerror=event=>{
+event.preventDefault();
+this.dispose(new Error('The conversion worker stopped. Press Enter to try again.'));
+};
+this.worker.onmessageerror=()=>this.dispose(new Error('The worker response could not be read.'));
+}
+request(kind,payload={},transfer=[]){
+if(!this.alive)return Promise.reject(new Error('The conversion worker is not available.'));
+const id=++this.sequence;
+return new Promise((resolve,reject)=>{
+const timer=setTimeout(()=>this.dispose(new Error('Guide processing timed out. Press Enter to try again.')),SETTINGS.workerTimeoutMs);
+this.pending.set(id,{resolve,reject,timer});
+try{this.worker.postMessage({id,kind,...payload},transfer);}
+catch(error){this.pending.delete(id);clearTimeout(timer);reject(error);}
+});
+}
+dispose(reason=new DOMException('Cancelled.','AbortError')){
+this.alive=false;
+this.worker.terminate();
+URL.revokeObjectURL(this.url);
+for(const request of this.pending.values()){clearTimeout(request.timer);request.reject(reason);}
+this.pending.clear();
+}
+}
+class GuideService{
+constructor(){this.processor=null;this.metadata=null;this.checkedAt=0;}
+async prepare(signal){
+aborted(signal);
+if(this.processor?.alive&&this.metadata&&Date.now()-this.checkedAt<SETTINGS.sourceLifetimeMs){
+return this.metadata;
+}
+this.metadata=null;
+this.checkedAt=0;
+if(!this.processor?.alive)this.processor=new Processor();
+const processor=this.processor;
+const bytes=await fetchBytes(SETTINGS.source,SETTINGS.maxDownloadBytes,signal);
+aborted(signal);
+const metadata=await processor.request('prepare',{buffer:bytes.buffer},[bytes.buffer]);
+aborted(signal);
+if(this.processor!==processor)throw new DOMException('Cancelled.','AbortError');
+this.metadata=metadata;
+this.checkedAt=Date.now();
+if(Date.now()-historyCheckedAt>=SETTINGS.sourceLifetimeMs)void updateHistory();
+return metadata;
+}
+async generate(tag,signal){
+await this.prepare(signal);
+aborted(signal);
+const text=await this.processor.request('generate',{tag});
+aborted(signal);
+return text;
+}
+clear(){
+this.processor?.dispose();
+this.processor=null;
+this.metadata=null;
+this.checkedAt=0;
+}
+}
+const service=new GuideService();
+function validTag(tag){
+return tag.length<=80&&/^[^#\s\p{Cc}]+#[0-9]{4,10}$/u.test(tag);
+}
+function announce(text,tone=''){
+ui.status.textContent=text;
+ui.status.dataset.tone=tone;
+}
+function render(){
+ui.form.setAttribute('aria-busy',String(active!==null));
+ui.tag.readOnly=active?.copying===true;
+}
+function current(job){
+return active===job&&job.revision===revision&&!job.controller.signal.aborted&&
+job.tag===ui.tag.value.trim();
+}
+function sameResult(tag){
+return result?.tag===tag&&service.processor?.alive&&
+Date.now()-service.checkedAt<SETTINGS.sourceLifetimeMs;
+}
+function legacyCopy(text){
+const field=document.createElement('textarea');
+const start=ui.tag.selectionStart;
+const end=ui.tag.selectionEnd;
+field.value=text;
+field.readOnly=true;
+field.tabIndex=-1;
+field.className='sr-only';
+document.body.append(field);
+let copied=false;
+try{
+field.focus({preventScroll:true});
+field.select();
+copied=document.execCommand('copy')===true;
+}catch{}
+finally{
+field.remove();
+ui.tag.focus({preventScroll:true});
+if(start!==null&&end!==null)ui.tag.setSelectionRange(start,end);
+}
+return copied;
+}
+async function copy(job,snapshot,explicit){
+if(!current(job)||snapshot.tag!==job.tag)return;
+job.copying=true;
+render();
+let copied=false;
+try{
+if(navigator.clipboard?.writeText){
+try{
+await navigator.clipboard.writeText(snapshot.text);
+copied=true;
+}catch{}
+}
+if(!current(job))return;
+if(!copied&&explicit)copied=legacyCopy(snapshot.text);
+if(!current(job))return;
+announce(copied?'Copied':explicit?'Allow clipboard access, then press Enter.':'Press Enter or tap the field to copy.',
+copied?'success':'');
+}finally{job.copying=false;}
+}
+async function submit(explicit=false){
+clearTimeout(inputTimer);
+if(active||composing)return;
+const tag=ui.tag.value.trim();
+if(!validTag(tag)){
+if(explicit){
+ui.tag.setCustomValidity('Enter a BattleTag such as BattleTag#0000.');
+ui.tag.setAttribute('aria-invalid','true');
+announce('Enter a valid BattleTag.','error');
+ui.tag.reportValidity();
+}
+return;
+}
+ui.tag.value=tag;
+ui.tag.setCustomValidity('');
+ui.tag.removeAttribute('aria-invalid');
+const job={tag,revision:++revision,controller:new AbortController(),copying:false};
+active=job;
+render();
+announce('Copying…');
+try{
+if(!sameResult(tag)){
+result=null;
+const text=await service.generate(tag,job.controller.signal);
+if(!current(job))return;
+result=Object.freeze({tag,text});
+}
+await copy(job,result,explicit);
+}catch(error){
+if(current(job))announce(error.message||'Could not copy. Press Enter to retry.','error');
+}finally{
+if(active===job){active=null;render();}
+}
+}
+function edited(){
+clearTimeout(inputTimer);
+revision++;
+if(active){
+const old=active;
+active=null;
+old.controller.abort();
+if(!old.copying)service.clear();
+}
+result=null;
+ui.tag.setCustomValidity('');
+ui.tag.removeAttribute('aria-invalid');
+announce('');
+render();
+if(!composing&&validTag(ui.tag.value.trim())){
+inputTimer=setTimeout(()=>{void submit(false);},SETTINGS.inputDelayMs);
+}
+}
+ui.form.addEventListener('submit',event=>{
+event.preventDefault();
+void submit(true);
+});
+ui.tag.addEventListener('input',edited);
+ui.tag.addEventListener('compositionstart',()=>{composing=true;edited();});
+ui.tag.addEventListener('compositionend',()=>{composing=false;edited();});
+ui.tag.addEventListener('click',()=>{
+if(!active&&result?.tag===ui.tag.value.trim()&&ui.status.dataset.tone!=='success')void submit(true);
+});
+async function updateHistory(){
+historyCheckedAt=Date.now();
+historyController?.abort();
+const controller=new AbortController();
+historyController=controller;
+ui.date.textContent='Last Update: …';
+ui.date.removeAttribute('datetime');
+try{
+const bytes=await fetchBytes(SETTINGS.history,512*1024,controller.signal,10000);
+const entries=JSON.parse(new TextDecoder().decode(bytes));
+const stamp=entries?.[0]?.commit?.committer?.date;
+if(typeof stamp!=='string'||Number.isNaN(Date.parse(stamp)))throw new Error('No commit date.');
+if(historyController!==controller)return;
+const updated=new Date(stamp);
+const dateLabel=new Intl.DateTimeFormat('en-US',{
+day:'numeric',month:'short',year:'numeric',timeZone:'UTC'
+}).format(updated);
+const timeLabel=new Intl.DateTimeFormat('en-US',{
+hour:'numeric',minute:'2-digit',hour12:true,
+timeZone:'UTC',timeZoneName:'short'
+}).format(updated);
+ui.date.dateTime=updated.toISOString();
+ui.date.textContent=`Last Update: ${dateLabel} - ${timeLabel}`;
+}catch{
+if(historyController===controller)ui.date.textContent='Last Update: Unavailable';
+}
+}
+window.addEventListener('pagehide',()=>{
+clearTimeout(inputTimer);
+revision++;
+active?.controller.abort();
+active=null;
+historyController?.abort();
+historyController=null;
+service.clear();
+result=null;
+});
+window.addEventListener('pageshow',event=>{
+if(event.persisted){
+composing=false;
+render();
+announce('');
+void updateHistory();
+}
+});
+render();
+void updateHistory();
+})();
+</script>
+</body>
+</html>
